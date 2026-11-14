@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ERA5</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f3f1eb;
+      --card: #fbfaf7;
+      --ink: #1c1b19;
+      --muted: #6d685f;
+      --line: #e3dfd4;
+      --soft: #f5f3ee;
+      --warn: #8a3d2f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--paper);
+      color: var(--ink);
+      font: 15px/1.5 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    main {
+      width: min(760px, calc(100% - 32px));
+      margin: 48px auto 72px;
+    }
+    h1 {
+      margin: 0 0 4px;
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+    }
+    .hint, .quiet { color: var(--muted); }
+    .label-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+    }
+    .label-row label { margin: 0; }
+    a { color: inherit; text-underline-offset: 3px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 22px;
+    }
+    label { display: block; margin-bottom: 6px; }
+    input[type="password"], input[type="text"], input[type="date"], select {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: white;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font: inherit;
+      color: inherit;
+    }
+    input:focus, select:focus { outline: 2px solid #d9d3c5; border-color: #c9c2b2; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row input { flex: 1; }
+    button, .ghost {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button.primary { background: #22211e; color: #f7f4ee; }
+    button.ghost, button.small {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    button.small { padding: 6px 10px; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    .stack { display: grid; gap: 14px; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .quarters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .choices {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 12px;
+      max-height: 240px;
+      overflow: auto;
+      padding: 8px 10px;
+      background: var(--soft);
+      border-radius: 12px;
+    }
+    .levels { display: flex; flex-wrap: wrap; gap: 6px 10px; }
+    .choice { display: flex; gap: 6px; align-items: baseline; margin: 0; color: var(--ink); }
+    .choice span { color: var(--muted); font-size: 13px; }
+    .radios { display: grid; gap: 6px; }
+    .radios label { margin: 0; display: flex; gap: 6px; align-items: center; }
+    .status { min-height: 3em; margin: 0; }
+    .status.warn { color: var(--warn); }
+    .bar {
+      height: 6px;
+      background: #ece7dc;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .bar div {
+      height: 100%;
+      width: 0;
+      background: #22211e;
+    }
+    code {
+      display: block;
+      margin-top: 8px;
+      padding: 8px 10px;
+      background: var(--soft);
+      border-radius: 8px;
+      word-break: break-all;
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 13px;
+    }
+    .hidden { display: none; }
+    @media (max-width: 640px) {
+      .split, .choices { grid-template-columns: 1fr; }
+      .quarters { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ERA5</h1>
+
+    <section id="keyCard" class="card stack">
+      <div class="label-row">
+        <label for="key">API key</label>
+        <a href="https://earthdatahub.destine.eu/quota-api-keys#my-personal-access-tokens" target="_blank" rel="noopener noreferrer">注册并获取</a>
+      </div>
+      <div class="row">
+        <input id="key" type="password" autocomplete="off" spellcheck="false">
+        <button id="toggleKey" class="small" type="button">显示</button>
+      </div>
+      <div>
+        <button id="connect" class="primary" type="button">接入</button>
+      </div>
+      <p id="keyStatus" class="status"></p>
+    </section>
+
+    <section id="workCard" class="card stack hidden">
+      <div class="row" style="justify-content: space-between;">
+        <div>
+          <strong id="coverage"></strong>
+          <div id="productNote" class="quiet"></div>
+        </div>
+        <button id="changeKey" class="ghost" type="button">更换 key</button>
+      </div>
+
+      <div>
+        <label for="dataset">数据集</label>
+        <select id="dataset"></select>
+      </div>
+      <div>
+        <label for="varFilter">变量</label>
+        <input id="varFilter" type="text" placeholder="筛选" autocomplete="off">
+        <div id="variables" class="choices" style="margin-top: 8px;"></div>
+      </div>
+      <div id="levelBlock">
+        <label>气压层</label>
+        <div id="levels" class="levels"></div>
+      </div>
+      <div class="split">
+        <div>
+          <label for="start">开始日期</label>
+          <input id="start" type="date">
+        </div>
+        <div>
+          <label for="end">结束日期</label>
+          <input id="end" type="date">
+        </div>
+      </div>
+      <div>
+        <div class="label-row">
+          <label>区域</label>
+          <span class="quiet">不填为全球</span>
+        </div>
+        <div class="quarters">
+          <input id="north" type="text" inputmode="decimal" placeholder="北" autocomplete="off">
+          <input id="west" type="text" inputmode="decimal" placeholder="西" autocomplete="off">
+          <input id="south" type="text" inputmode="decimal" placeholder="南" autocomplete="off">
+          <input id="east" type="text" inputmode="decimal" placeholder="东" autocomplete="off">
+        </div>
+      </div>
+      <div>
+        <label>时间尺度</label>
+        <div id="resolutions" class="radios"></div>
+      </div>
+      <div>
+        <label for="output">输出目录</label>
+        <input id="output" type="text" spellcheck="false">
+      </div>
+      <p id="estimate" class="status"></p>
+      <div class="row">
+        <button id="download" class="primary" type="button" disabled>输出链接</button>
+        <button id="cancel" class="ghost hidden" type="button">取消</button>
+      </div>
+      <div id="progressWrap" class="hidden">
+        <div class="bar"><div id="barFill"></div></div>
+        <p id="progressText" class="quiet"></p>
+        <code id="donePath" class="hidden"></code>
+      </div>
+    </section>
+  </main>
+  <script>
+    const state = {
+      session: null,
+      catalog: null,
+      datasets: [],
+      estimate: null,
+      job: null,
+      timer: null,
+      poll: null,
+      opening: false,
+    };
+
+    const keyCard = document.getElementById("keyCard");
+    const workCard = document.getElementById("workCard");
+    const keyInput = document.getElementById("key");
+    const keyStatus = document.getElementById("keyStatus");
+    const estimateEl = document.getElementById("estimate");
+
+    function setStatus(node, text, warn) {
+      node.textContent = text || "";
+      node.classList.toggle("warn", Boolean(warn));
+    }
+
+    async function api(path, body, method) {
+      const response = await fetch(path, {
+        method: method || (body ? "POST" : "GET"),
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || "请求失败");
+      }
+      return data;
+    }
+
+    function checked(name) {
+      return [...document.querySelectorAll(`input[data-kind="${name}"]:checked`)].map((node) => node.value);
+    }
+
+    function numberOrNull(id) {
+      const text = document.getElementById(id).value.trim();
+      if (!text) return null;
+      const value = Number(text);
+      return Number.isFinite(value) ? value : text;
+    }
+
+    function selectionBody() {
+      const chosen = document.querySelector("input[name=resolution]:checked");
+      const needLevels = state.catalog && state.catalog.levels && state.catalog.levels.length;
+      return {
+        session: state.session,
+        dataset: document.getElementById("dataset").value,
+        variables: checked("var"),
+        levels: needLevels ? checked("lev").map(Number) : [],
+        start: document.getElementById("start").value,
+        end: document.getElementById("end").value,
+        north: numberOrNull("north"),
+        west: numberOrNull("west"),
+        south: numberOrNull("south"),
+        east: numberOrNull("east"),
+        resolution: chosen ? chosen.value : "",
+        output_dir: document.getElementById("output").value,
+      };
+    }
+
+    function fillDatasets(datasets, active) {
+      const select = document.getElementById("dataset");
+      select.replaceChildren();
+      for (const item of datasets) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = item.label;
+        option.selected = item.id === active;
+        select.append(option);
+      }
+    }
+
+    function renderCatalog(catalog) {
+      const variables = document.getElementById("variables");
+      const levels = document.getElementById("levels");
+      variables.replaceChildren();
+      levels.replaceChildren();
+      document.getElementById("varFilter").value = "";
+      const pressure = String(catalog.dataset || "").includes("pressure");
+      const preferred = new Set(["q", "u", "v"]);
+      for (const item of catalog.variables) {
+        const label = document.createElement("label");
+        label.className = "choice";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.dataset.kind = "var";
+        input.value = item.name;
+        input.checked = pressure && preferred.has(item.name);
+        const name = document.createElement("b");
+        name.textContent = item.name;
+        const meta = document.createElement("span");
+        meta.textContent = [item.long_name, item.units].filter(Boolean).join(" · ");
+        label.append(input, name, meta);
+        variables.append(label);
+      }
+      const levelBlock = document.getElementById("levelBlock");
+      if (catalog.levels && catalog.levels.length) {
+        levelBlock.classList.remove("hidden");
+        for (const level of catalog.levels) {
+          const label = document.createElement("label");
+          label.className = "choice";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.dataset.kind = "lev";
+          input.value = String(level);
+          input.checked = pressure && Number(level) === 925;
+          label.append(input, document.createTextNode(String(level)));
+          levels.append(label);
+        }
+      } else {
+        levelBlock.classList.add("hidden");
+      }
+      const resolutions = document.getElementById("resolutions");
+      resolutions.replaceChildren();
+      const preferDaily = (catalog.resolutions || []).some((item) => item.id === "daily");
+      for (const item of catalog.resolutions || []) {
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = "resolution";
+        input.value = item.id;
+        input.checked = preferDaily ? item.id === "daily" : item.id === catalog.resolutions[0].id;
+        label.append(input, document.createTextNode(item.label));
+        resolutions.append(label);
+      }
+      const levelCount = catalog.levels && catalog.levels.length ? ` · ${catalog.levels.length} 个气压层` : "";
+      document.getElementById("coverage").textContent =
+        `${catalog.label} · ${catalog.first_day} 至 ${catalog.last_day} · ${catalog.grid}${levelCount}`;
+      document.getElementById("productNote").textContent = catalog.note || "";
+      if (!document.getElementById("output").value) {
+        document.getElementById("output").value = catalog.default_output;
+      }
+      document.getElementById("start").min = catalog.first_day;
+      document.getElementById("start").max = catalog.last_day;
+      document.getElementById("end").min = catalog.first_day;
+      document.getElementById("end").max = catalog.last_day;
+    }
+
+    function scheduleEstimate() {
+      clearTimeout(state.timer);
+      state.timer = setTimeout(runEstimate, 350);
+    }
+
+    async function runEstimate() {
+      if (state.opening || !state.catalog) return;
+      const body = selectionBody();
+      const needLevels = state.catalog.levels && state.catalog.levels.length;
+      if (!body.variables.length || (needLevels && !body.levels.length) || !body.start || !body.end ||
+          !body.resolution) {
+        state.estimate = null;
+        document.getElementById("download").disabled = true;
+        setStatus(estimateEl, "", false);
+        return;
+      }
+      try {
+        const plan = await api("/api/estimate", body);
+        state.estimate = plan;
+        document.getElementById("download").disabled = !plan.allowed || state.job;
+        setStatus(estimateEl, plan.message, !plan.allowed);
+      } catch (error) {
+        state.estimate = null;
+        document.getElementById("download").disabled = true;
+        setStatus(estimateEl, error.message, true);
+      }
+    }
+
+    function showProgress(data) {
+      const wrap = document.getElementById("progressWrap");
+      const fill = document.getElementById("barFill");
+      const text = document.getElementById("progressText");
+      const path = document.getElementById("donePath");
+      wrap.classList.remove("hidden");
+      const total = data.total || 1;
+      const ratio = data.state === "done" ? 1 : Math.max(0, Math.min(1, (data.done || 0) / total));
+      fill.style.width = `${Math.round(ratio * 100)}%`;
+      text.textContent = data.message || "";
+      if (data.state === "done" && data.path) {
+        path.textContent = data.path;
+        path.classList.remove("hidden");
+      } else {
+        path.classList.add("hidden");
+      }
+    }
+
+    async function poll() {
+      if (!state.job) return;
+      try {
+        const data = await api(`/api/status?job=${encodeURIComponent(state.job)}`);
+        showProgress(data);
+        if (data.state === "done" || data.state === "error" || data.state === "cancelled" || data.state === "idle") {
+          clearInterval(state.poll);
+          state.poll = null;
+          state.job = null;
+          document.getElementById("cancel").classList.add("hidden");
+          document.getElementById("download").disabled = !(state.estimate && state.estimate.allowed);
+          if (data.state === "error") setStatus(estimateEl, data.message || "下载失败", true);
+          if (data.state === "cancelled") setStatus(estimateEl, "已取消", false);
+        }
+      } catch (error) {
+        setStatus(estimateEl, error.message, true);
+      }
+    }
+
+    async function openDataset(id) {
+      state.opening = true;
+      state.estimate = null;
+      document.getElementById("download").disabled = true;
+      setStatus(estimateEl, "正在读取…", false);
+      try {
+        const catalog = await api("/api/open", { session: state.session, dataset: id });
+        state.catalog = catalog;
+        renderCatalog(catalog);
+        state.opening = false;
+        scheduleEstimate();
+      } catch (error) {
+        state.opening = false;
+        setStatus(estimateEl, error.message, true);
+      }
+    }
+
+    document.getElementById("toggleKey").addEventListener("click", () => {
+      const show = keyInput.type === "password";
+      keyInput.type = show ? "text" : "password";
+      document.getElementById("toggleKey").textContent = show ? "隐藏" : "显示";
+    });
+
+    keyInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") document.getElementById("connect").click();
+    });
+
+    document.getElementById("connect").addEventListener("click", async () => {
+      const button = document.getElementById("connect");
+      button.disabled = true;
+      setStatus(keyStatus, "正在接入…", false);
+      try {
+        const catalog = await api("/api/connect", { key: keyInput.value });
+        keyInput.value = "";
+        state.session = catalog.session;
+        state.catalog = catalog;
+        state.datasets = catalog.datasets || [];
+        fillDatasets(state.datasets, catalog.dataset);
+        renderCatalog(catalog);
+        keyCard.classList.add("hidden");
+        workCard.classList.remove("hidden");
+        scheduleEstimate();
+      } catch (error) {
+        setStatus(keyStatus, error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById("changeKey").addEventListener("click", () => {
+      if (state.poll) clearInterval(state.poll);
+      state.session = null;
+      state.catalog = null;
+      state.estimate = null;
+      state.job = null;
+      state.opening = false;
+      workCard.classList.add("hidden");
+      keyCard.classList.remove("hidden");
+      setStatus(keyStatus, "", false);
+    });
+
+    document.getElementById("dataset").addEventListener("change", () => {
+      const id = document.getElementById("dataset").value;
+      if (!state.session || !id) return;
+      openDataset(id);
+    });
+
+    document.getElementById("varFilter").addEventListener("input", () => {
+      const query = document.getElementById("varFilter").value.trim().toLowerCase();
+      for (const label of document.querySelectorAll("#variables label")) {
+        const text = label.textContent.toLowerCase();
+        label.classList.toggle("hidden", Boolean(query) && !text.includes(query));
+      }
+    });
+
+    workCard.addEventListener("change", (event) => {
+      if (event.target.id === "dataset" || event.target.id === "varFilter") return;
+      scheduleEstimate();
+    });
+    workCard.addEventListener("input", (event) => {
+      if (event.target.id === "output" || event.target.id === "varFilter" || event.target.id === "dataset") return;
+      scheduleEstimate();
+    });
+
+    document.getElementById("download").addEventListener("click", async () => {
+      const plan = state.estimate;
+      if (!plan || !plan.allowed) return;
+      document.getElementById("download").disabled = true;
+      setStatus(estimateEl, "正在写出链接…", false);
+      try {
+        const result = await api("/api/download", selectionBody());
+        const wrap = document.getElementById("progressWrap");
+        wrap.classList.remove("hidden");
+        document.getElementById("barFill").style.width = "100%";
+        document.getElementById("progressText").textContent = `已写出 ${result.count} 条链接`;
+        const path = document.getElementById("donePath");
+        path.textContent = result.path || "";
+        path.classList.remove("hidden");
+        setStatus(estimateEl, "文件里含有你的 key，不要发给别人。", false);
+      } catch (error) {
+        setStatus(estimateEl, error.message, true);
+      } finally {
+        document.getElementById("download").disabled = !(state.estimate && state.estimate.allowed);
+      }
+    });
+
+    document.getElementById("cancel").addEventListener("click", async () => {
+      if (!state.job) return;
+      try {
+        await api("/api/cancel", { job: state.job });
+      } catch (error) {
+        setStatus(estimateEl, error.message, true);
+      }
+    });
+  </script>
+</body>
+</html>
