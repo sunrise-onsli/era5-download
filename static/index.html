@@ -49,7 +49,7 @@
       padding: 22px;
     }
     label { display: block; margin-bottom: 6px; }
-    input[type="password"], input[type="text"], input[type="date"], select {
+    input[type="password"], input[type="text"], select {
       width: 100%;
       border: 1px solid var(--line);
       background: white;
@@ -90,6 +90,26 @@
       border-radius: 12px;
     }
     .levels { display: flex; flex-wrap: wrap; gap: 6px 10px; }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 8px;
+      max-height: 168px;
+      overflow: auto;
+      padding: 8px 10px;
+      background: var(--soft);
+      border-radius: 12px;
+    }
+    .chips label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin: 0;
+      min-width: 3.2em;
+      font-variant-numeric: tabular-nums;
+    }
+    #years label { min-width: 5.2em; }
+    .pick { display: flex; gap: 6px; }
     .choice { display: flex; gap: 6px; align-items: baseline; margin: 0; color: var(--ink); }
     .choice span { color: var(--muted); font-size: 13px; }
     .radios { display: grid; gap: 6px; }
@@ -165,15 +185,35 @@
         <label>气压层</label>
         <div id="levels" class="levels"></div>
       </div>
-      <div class="split">
-        <div>
-          <label for="start">开始日期</label>
-          <input id="start" type="date">
+      <div>
+        <div class="label-row">
+          <label>年</label>
+          <span class="pick">
+            <button type="button" class="small" data-pick="years" data-mode="all">全选</button>
+            <button type="button" class="small" data-pick="years" data-mode="none">清除</button>
+          </span>
         </div>
-        <div>
-          <label for="end">结束日期</label>
-          <input id="end" type="date">
+        <div id="years" class="chips"></div>
+      </div>
+      <div>
+        <div class="label-row">
+          <label>月</label>
+          <span class="pick">
+            <button type="button" class="small" data-pick="months" data-mode="all">全选</button>
+            <button type="button" class="small" data-pick="months" data-mode="none">清除</button>
+          </span>
         </div>
+        <div id="months" class="chips"></div>
+      </div>
+      <div id="dayBlock">
+        <div class="label-row">
+          <label>日</label>
+          <span class="pick">
+            <button type="button" class="small" data-pick="days" data-mode="all">全选</button>
+            <button type="button" class="small" data-pick="days" data-mode="none">清除</button>
+          </span>
+        </div>
+        <div id="days" class="chips"></div>
       </div>
       <div>
         <div class="label-row">
@@ -197,7 +237,7 @@
       </div>
       <p id="estimate" class="status"></p>
       <div class="row">
-        <button id="download" class="primary" type="button" disabled>输出链接</button>
+        <button id="download" class="primary" type="button" disabled>下载</button>
         <button id="cancel" class="ghost hidden" type="button">取消</button>
       </div>
       <div id="progressWrap" class="hidden">
@@ -262,8 +302,9 @@
         dataset: document.getElementById("dataset").value,
         variables: checked("var"),
         levels: needLevels ? checked("lev").map(Number) : [],
-        start: document.getElementById("start").value,
-        end: document.getElementById("end").value,
+        years: checked("year").map(Number),
+        months: checked("month").map(Number),
+        days: state.catalog && state.catalog.native === "monthly" ? [] : checked("day").map(Number),
         north: numberOrNull("north"),
         west: numberOrNull("west"),
         south: numberOrNull("south"),
@@ -345,10 +386,25 @@
       if (!document.getElementById("output").value) {
         document.getElementById("output").value = catalog.default_output;
       }
-      document.getElementById("start").min = catalog.first_day;
-      document.getElementById("start").max = catalog.last_day;
-      document.getElementById("end").min = catalog.first_day;
-      document.getElementById("end").max = catalog.last_day;
+      fillChecks("years", catalog.years || [], "year");
+      fillChecks("months", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], "month");
+      fillChecks("days", Array.from({ length: 31 }, (_, index) => index + 1), "day");
+      document.getElementById("dayBlock").classList.toggle("hidden", catalog.native === "monthly");
+    }
+
+    function fillChecks(id, values, kind) {
+      const box = document.getElementById(id);
+      box.replaceChildren();
+      for (const value of values) {
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.dataset.kind = kind;
+        input.value = String(value);
+        const text = kind === "year" ? String(value) : String(value).padStart(2, "0");
+        label.append(input, document.createTextNode(text));
+        box.append(label);
+      }
     }
 
     function scheduleEstimate() {
@@ -360,8 +416,9 @@
       if (state.opening || !state.catalog) return;
       const body = selectionBody();
       const needLevels = state.catalog.levels && state.catalog.levels.length;
-      if (!body.variables.length || (needLevels && !body.levels.length) || !body.start || !body.end ||
-          !body.resolution) {
+      const needDays = state.catalog.native !== "monthly";
+      if (!body.variables.length || (needLevels && !body.levels.length) || !body.years.length ||
+          !body.months.length || (needDays && !body.days.length) || !body.resolution) {
         state.estimate = null;
         document.getElementById("download").disabled = true;
         setStatus(estimateEl, "", false);
@@ -500,24 +557,29 @@
       scheduleEstimate();
     });
 
+    workCard.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-pick]");
+      if (!button) return;
+      const box = document.getElementById(button.dataset.pick);
+      if (!box) return;
+      const on = button.dataset.mode === "all";
+      for (const input of box.querySelectorAll("input")) input.checked = on;
+      scheduleEstimate();
+    });
+
     document.getElementById("download").addEventListener("click", async () => {
       const plan = state.estimate;
-      if (!plan || !plan.allowed) return;
+      if (!plan || !plan.allowed || state.job) return;
       document.getElementById("download").disabled = true;
-      setStatus(estimateEl, "正在写出链接…", false);
+      setStatus(estimateEl, "正在开始下载…", false);
       try {
-        const result = await api("/api/download", selectionBody());
-        const wrap = document.getElementById("progressWrap");
-        wrap.classList.remove("hidden");
-        document.getElementById("barFill").style.width = "100%";
-        document.getElementById("progressText").textContent = `已写出 ${result.count} 条链接`;
-        const path = document.getElementById("donePath");
-        path.textContent = result.path || "";
-        path.classList.remove("hidden");
-        setStatus(estimateEl, "文件里含有你的 key，不要发给别人。", false);
+        const started = await api("/api/download", selectionBody());
+        state.job = started.job;
+        document.getElementById("cancel").classList.remove("hidden");
+        showProgress({ state: "running", done: 0, total: 1, message: "正在下载…" });
+        state.poll = setInterval(poll, 1000);
       } catch (error) {
         setStatus(estimateEl, error.message, true);
-      } finally {
         document.getElementById("download").disabled = !(state.estimate && state.estimate.allowed);
       }
     });

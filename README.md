@@ -1,6 +1,6 @@
 # ERA5 Download
 
-本地程序。给定数据集、变量、气压层、时间和区域后，写出 [Earth Data Hub](https://earthdatahub.destine.eu/collections/era5) 上对应 ERA5 Zarr 对象的 HTTPS 地址，每行一条，存为 txt。取数由用户自己的 HTTP 客户端完成。
+本地程序。给定数据集、变量、气压层、年、月、日和区域后，用内置的 [aria2](https://aria2.github.io/) 从 [Earth Data Hub](https://earthdatahub.destine.eu/collections/era5) 的 ERA5 Zarr 镜像取出对应对象，写成一个 NetCDF。
 
 程序由 Grok（xAI）编写，仅供科研使用。
 
@@ -40,25 +40,21 @@ API key 在 [账户页](https://earthdatahub.destine.eu/quota-api-keys#my-person
 
 ## 输出
 
-txt 写在页面指定的目录。文件名包含数据集标识、变量、气压层和起止日期。
+结果是一个 NetCDF，写在页面指定的目录。文件名包含数据集、变量、气压层、时间尺度，以及所选的年、月、日。
 
-每行格式：
+年、月、日分开勾选，取它们的组合。例如勾选 2002 与 2010 年、1 与 7 月、1 与 15 日，得到这 8 个日期。2 月 31 日这种日期会跳过。月值数据集只选年和月。
 
-```text
-https://edh:<api-key>@data.earthdatahub.destine.eu/<store>/<variable>/<chunk-key>
-```
+时间尺度决定写出的时次。小时、3 小时和 6 小时从当天的分析里取对应时次。日平均和月平均在这些时次上计算。日值和月值用数据集里已经存好的值。
 
-`<chunk-key>` 来自该数组的 `chunk_key_encoding`。Zarr v3 默认编码为 `c/i/j/...`；v2 为以 `.` 分隔的下标。数组若有 shard，下标按 shard 网格；否则按 chunk 网格。
-
-列入的对象是与所选时间、层次、纬度和经度相交的存储块。程序不裁块，也不做时间平均。界面上的时间尺度不改变对象列表。
+aria2 下载与所选时间、层次、纬度和经度相交的存储块。NetCDF 只保留选中的格点，并按所选时间尺度处理。分块键来自该数组的 `chunk_key_encoding`。Zarr v3 默认是 `c/i/j/...`，v2 是以 `.` 分隔的下标。数组若有 shard，按 shard 网格取；否则按 chunk 网格取。
 
 区域四项都留空时，范围取该数据集的全部水平网格。气压层产品为全球。ERA5-Land 的纬度止于其坐标南端，约 57°S。四项中只填一部分时拒绝执行。
 
 经度为 0–360。跨 0° 时西界写负值，例如西 `-20`、东 `20`。跨日期变更线时东界取更大的 0–360 值，例如西 `170`、东 `190`。
 
-目标 txt 已存在则不覆盖。对象数超过 20000 时中止。
+目标文件已存在则不覆盖。对象数超过 20000 时中止。
 
-URL 中含 API key。该 txt 不要入库，也不要外传。
+API key 只写入当次下载的临时配置，传输结束后删除。NetCDF 里没有 key。
 
 ## 运行
 
@@ -71,9 +67,9 @@ py -3 app.py
 
 Windows 下可执行 `启动.bat`。服务绑定 `127.0.0.1:8765` 并打开浏览器。未指定 `--port` 且 8765 被占用时改用 8766。`--no-browser` 只启动服务。
 
-页面顺序：填 key 并接入；选择数据集、变量、气压层、日期和区域；输出链接。输出目录在页面填写。
+页面顺序：填 key 并接入；选择数据集、变量、气压层、年、月、日和区域；下载。输出目录在页面填写。
 
-接入和切换数据集时读取坐标、变量和分块形状。生成链接时读取分块键。这两步不传输场值。
+接入和切换数据集时读取坐标、变量和分块形状。下载时由内置 aria2 1.37.0 取对象，再写成 NetCDF。aria2 作为单独进程运行，许可证为 GPL-2.0，见 `third_party/aria2/COPYING`。源码在 https://github.com/aria2/aria2/releases/tag/release-1.37.0 。
 
 窗口程序：
 
@@ -85,6 +81,6 @@ py -3 -m PyInstaller --noconfirm --distpath . --workpath build ERA5选取.spec
 
 ## 来源
 
-程序由 Grok（xAI）编写。
+程序由 Grok（xAI）编写。下载使用 aria2。
 
 ERA5 由 ECMWF 制作，Copernicus Climate Data Store 发布。Zarr 镜像由 Earth Data Hub 提供。

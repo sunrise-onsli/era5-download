@@ -3,6 +3,7 @@ __pycache__/
 build/
 dist/
 *.exe
+!third_party/aria2/aria2c.exe
 *.log
 *.writing
 .venv/

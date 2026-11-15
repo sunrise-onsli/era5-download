@@ -1,10 +1,10 @@
 """Local picker for Earth Data Hub ERA5 stores.
 
-The API key stays in process memory. The link list is the one file that
-receives it, so a person's own download tool can authenticate. Logs, the
-page, and HTTP responses do not include the key or the lines.
-Opening a dataset reads coordinates and chunk layout. Writing the list
-reads chunk addresses only, not array values.
+The API key stays in process memory. aria2 receives it only in a temporary
+config, which is removed when the transfer ends. The NetCDF, logs, page,
+and HTTP responses do not include the key.
+Opening a dataset reads coordinates and chunk layout. Downloading fetches
+the selected objects with aria2 and writes one NetCDF.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import math
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import threading
 import traceback
@@ -25,7 +27,7 @@ import urllib.request
 import warnings
 import webbrowser
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import product
 from pathlib import Path
@@ -525,11 +527,7 @@ def output_steps(selection: "Selection", native: str) -> int:
     if selection.resolution == "daily":
         return selection.days
     if selection.resolution == "monthly":
-        return (
-            (selection.end.year - selection.start.year) * 12
-            + (selection.end.month - selection.start.month)
-            + 1
-        )
+        return len({(item.year, item.month) for item in selection.dates})
     raise RuntimeError("未知的时间尺度")
 
 
@@ -548,6 +546,7 @@ class Selection:
     levels: list[float]
     start: date
     end: date
+    dates: list
     north: float
     south: float
     west: float
@@ -556,12 +555,13 @@ class Selection:
     lat_i0: int
     lat_i1: int
     lon_segments: list
+    time_ranges: list
     time_i0: int
     time_i1: int
 
     @property
     def days(self) -> int:
-        return (self.end - self.start).days + 1
+        return len(self.dates)
 
     @property
     def nlat(self) -> int:
@@ -589,6 +589,8 @@ class Job:
         self.destination = destination
         self.temporary = destination.with_suffix(".writing.nc")
         self.cancel = threading.Event()
+        self.process: subprocess.Popen | None = None
+        self.cache: Path | None = None
         self.lock = threading.Lock()
         self.state = "running"
         self.done = 0
@@ -994,6 +996,172 @@ def time_bounds(start: date, end: date, catalog: dict) -> tuple[int, int]:
     return i0, i1
 
 
+def parse_int_list(value, label: str, low: int, high: int) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"请至少选择一个{label}")
+    chosen: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"{label}无效")
+        if isinstance(item, float) and not item.is_integer():
+            raise ValueError(f"{label}无效")
+        number = int(item)
+        if number < low or number > high:
+            raise ValueError(f"{label}超出范围")
+        if number not in chosen:
+            chosen.append(number)
+    chosen.sort()
+    return chosen
+
+
+def expand_dates(years: list[int], months: list[int], days: list[int], first: date, last: date, native: str) -> list[date]:
+    found: list[date] = []
+    if native == "monthly":
+        for year in years:
+            for month in months:
+                start = date(year, month, 1)
+                if month == 12:
+                    end = date(year, 12, 31)
+                else:
+                    end = date(year, month + 1, 1) - timedelta(days=1)
+                if end < first or start > last:
+                    continue
+                found.append(start)
+        return found
+    for year in years:
+        for month in months:
+            for day in days:
+                try:
+                    current = date(year, month, day)
+                except ValueError:
+                    continue
+                if first <= current <= last:
+                    found.append(current)
+    return found
+
+
+def day_span(current: date, catalog: dict) -> tuple[int, int]:
+    origin = pd.Timestamp(catalog["time_start"])
+    native = catalog["native"]
+    size = int(catalog["time_size"])
+    if native == "monthly":
+        stamp = pd.Timestamp(year=current.year, month=current.month, day=int(origin.day))
+        index = month_index(stamp, origin)
+        if index < 0 or index >= size:
+            raise ValueError(f"{current.year:04d}-{current.month:02d} 不在时间轴上")
+        return index, index
+    if native == "hourly":
+        step = pd.Timedelta(hours=1)
+        count = 24
+    elif native == "3hourly":
+        step = pd.Timedelta(hours=3)
+        count = 8
+    else:
+        step = pd.Timedelta(days=1)
+        count = 1
+    start_stamp = pd.Timestamp(current) + (origin - origin.normalize())
+    delta = (start_stamp - origin) / step
+    i0 = int(round(float(delta)))
+    if abs(float(delta) - i0) > 1e-6:
+        raise ValueError("日期没有落在时间轴上")
+    i1 = i0 + count - 1
+    if i0 < 0 or i1 >= size:
+        raise ValueError("日期超出数据集覆盖范围")
+    return i0, i1
+
+
+def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    ordered = sorted(ranges)
+    merged = [[ordered[0][0], ordered[0][1]]]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(int(start), int(end)) for start, end in merged]
+
+
+def parse_calendar(payload: dict, catalog: dict) -> tuple[list[date], list[tuple[int, int]]]:
+    first = date.fromisoformat(catalog["first_day"])
+    last = date.fromisoformat(catalog["last_day"])
+    years = parse_int_list(payload.get("years"), "年份", first.year, last.year)
+    months = parse_int_list(payload.get("months"), "月份", 1, 12)
+    if catalog["native"] == "monthly":
+        days: list[int] = []
+    else:
+        days = parse_int_list(payload.get("days"), "日期", 1, 31)
+    dates = expand_dates(years, months, days, first, last, catalog["native"])
+    if not dates:
+        raise ValueError("这些年、月、日里没有落在数据集内的日期")
+    ranges = merge_ranges([day_span(item, catalog) for item in dates])
+    return dates, ranges
+
+
+def covered_chunks(ranges: list[tuple[int, int]], chunk: int) -> int:
+    found: set[int] = set()
+    for start, end in ranges:
+        found.update(range(start // chunk, end // chunk + 1))
+    return len(found)
+
+
+def number_phrase(values: list[int], unit: str) -> str:
+    ordered = sorted(set(values))
+    parts: list[str] = []
+    start = prev = ordered[0]
+    for value in ordered[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        if start == prev:
+            parts.append(f"{start}{unit}")
+        else:
+            parts.append(f"{start}–{prev}{unit}")
+        start = prev = value
+    if start == prev:
+        parts.append(f"{start}{unit}")
+    else:
+        parts.append(f"{start}–{prev}{unit}")
+    return "、".join(parts)
+
+
+def selection_phrase(selection: Selection, catalog: dict) -> str:
+    years = [item.year for item in selection.dates]
+    months = [item.month for item in selection.dates]
+    text = f"{number_phrase(years, '年')}，{number_phrase(months, '月')}"
+    if catalog["native"] == "monthly":
+        return f"{text}，共 {len(selection.dates)} 个月"
+    days = [item.day for item in selection.dates]
+    return f"{text}，{number_phrase(days, '日')}，共 {len(selection.dates)} 天"
+
+
+def compact_numbers(values: list[int]) -> str:
+    ordered = sorted(set(values))
+    parts: list[str] = []
+    start = prev = ordered[0]
+    for value in ordered[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = value
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ".".join(parts)
+
+
+def file_tag(selection: Selection, catalog: dict) -> str:
+    years = [item.year for item in selection.dates]
+    months = [item.month for item in selection.dates]
+    tag = f"y{compact_numbers(years)}_m{compact_numbers(months)}"
+    if catalog["native"] != "monthly":
+        days = [item.day for item in selection.dates]
+        tag += f"_d{compact_numbers(days)}"
+    if len(tag) > 80:
+        tag = f"n{len(selection.dates)}_{selection.start.isoformat()}_{selection.end.isoformat()}"
+    return tag
+
+
 def parse_selection(payload: dict, catalog: dict) -> Selection:
     names = payload.get("variables")
     if not isinstance(names, list) or not names:
@@ -1006,27 +1174,20 @@ def parse_selection(payload: dict, catalog: dict) -> Selection:
         if name not in variables:
             variables.append(name)
     levels = match_levels(payload.get("levels"), catalog)
-    start = parse_day(payload.get("start"), "开始日期")
-    end = parse_day(payload.get("end"), "结束日期")
-    if end < start:
-        raise ValueError("结束日期要在开始日期之后或同一天")
-    first = date.fromisoformat(catalog["first_day"])
-    last = date.fromisoformat(catalog["last_day"])
-    if start < first or end > last:
-        raise ValueError(f"日期需落在 {first.isoformat()} 到 {last.isoformat()} 之间")
     allowed = {item["id"] for item in catalog["resolutions"]}
     resolution = payload.get("resolution")
     if resolution not in allowed:
         labels = "、".join(item["label"] for item in catalog["resolutions"])
         raise ValueError(f"这个数据集的时间尺度是：{labels}")
+    dates, ranges = parse_calendar(payload, catalog)
     north, south, lat_i0, lat_i1, segments = region_selection(payload, catalog)
-    i0, i1 = time_bounds(start, end, catalog)
     return Selection(
         dataset_id=catalog["id"],
         variables=variables,
         levels=levels,
-        start=start,
-        end=end,
+        start=dates[0],
+        end=dates[-1],
+        dates=dates,
         north=north,
         south=south,
         west=float(segments[0]["west"]),
@@ -1035,8 +1196,9 @@ def parse_selection(payload: dict, catalog: dict) -> Selection:
         lat_i0=lat_i0,
         lat_i1=lat_i1,
         lon_segments=segments,
-        time_i0=i0,
-        time_i1=i1,
+        time_ranges=ranges,
+        time_i0=ranges[0][0],
+        time_i1=ranges[-1][1],
     )
 
 
@@ -1053,7 +1215,7 @@ def resolution_label(selection: Selection, catalog: dict) -> str:
 
 def estimate(selection: Selection, catalog: dict) -> dict:
     chunks_spec = catalog["chunks"]
-    n_time_chunks = span_chunks(selection.time_i0, selection.time_i1, chunks_spec["time"])
+    n_time_chunks = covered_chunks(selection.time_ranges, chunks_spec["time"])
     n_lat_chunks = span_chunks(selection.lat_i0, selection.lat_i1, chunks_spec["latitude"])
     n_lon_chunks = sum(
         span_chunks(segment["i0"], segment["i1"], chunks_spec["longitude"])
@@ -1085,7 +1247,7 @@ def estimate(selection: Selection, catalog: dict) -> dict:
     output_bytes = ntime * selection.nlat * selection.nlon * len(selection.variables) * nlevel * 4
     reasons = []
     if n_chunks > MAX_CHUNKS:
-        reasons.append("链接超过 20000 条，请缩小范围。")
+        reasons.append("对象超过 20000 个，请缩小范围。")
     span = selection.lon_segments
     whole = (
         selection.lat_i0 == 0
@@ -1096,9 +1258,9 @@ def estimate(selection: Selection, catalog: dict) -> dict:
     )
     region_text = "全球，" if whole else ""
     message = (
-        f"{catalog['label']}，{region_text}{selection.start.isoformat()} 至 {selection.end.isoformat()}，"
-        f"{len(selection.variables)} 个变量，{n_chunks} 条链接。"
-        "每条是覆盖该日期和区域的原始分块，不截取、不平均。"
+        f"{catalog['label']}，{region_text}{selection_phrase(selection, catalog)}，"
+        f"{resolution_label(selection, catalog)}，{len(selection.variables)} 个变量，"
+        f"{n_chunks} 个对象，结果约 {human_bytes(output_bytes)}。"
     )
     if reasons:
         message += "".join(reasons)
@@ -1142,7 +1304,7 @@ def resolve_output_dir(value) -> Path:
     return resolved
 
 
-def output_name(selection: Selection) -> str:
+def output_name(selection: Selection, catalog: dict) -> str:
     variables = "-".join(selection.variables)
     if len(variables) > 40:
         variables = f"{len(selection.variables)}vars"
@@ -1152,9 +1314,9 @@ def output_name(selection: Selection) -> str:
         if len(levels) > 40:
             levels = f"{len(selection.levels)}lev"
         parts.append(f"{levels}hPa")
-    parts.append(selection.start.isoformat())
-    parts.append(selection.end.isoformat())
-    name = "_".join(parts) + ".txt"
+    parts.append(selection.resolution)
+    parts.append(file_tag(selection, catalog))
+    name = "_".join(parts) + ".nc"
     if any(char in name for char in '\\/:*?"<>|'):
         raise ValueError("文件名无效")
     return name
@@ -1178,7 +1340,7 @@ def shard_ids(ranges: list[tuple[int, int]], size: int) -> list[int]:
 
 def dimension_ranges(dim: str, selection: Selection, catalog: dict) -> list[tuple[int, int]]:
     if dim == catalog["time_name"]:
-        return [(selection.time_i0, selection.time_i1)]
+        return list(selection.time_ranges)
     if dim == catalog["lat_name"]:
         return [(selection.lat_i0, selection.lat_i1)]
     if dim == catalog["lon_name"]:
@@ -1245,12 +1407,12 @@ def link_lines(selection: Selection, catalog: dict, key: str) -> list[str]:
             key_text = encode_chunk_key(layout["style"], layout["separator"], coords)
             lines.append(f"{root}/{name}/{key_text}")
     if len(lines) > MAX_CHUNKS:
-        raise RuntimeError("链接超过 20000 条，请缩小范围。")
+        raise RuntimeError("对象超过 20000 个，请缩小范围。")
     return lines
 
 
 def write_links(selection: Selection, catalog: dict, key: str, directory: Path) -> tuple[Path, int]:
-    destination = directory / output_name(selection)
+    destination = directory / output_name(selection, catalog)
     if destination.exists():
         raise ValueError(f"目标文件已存在：{destination.name}。请换目录或先移走该文件。")
     lines = link_lines(selection, catalog, key)
@@ -1264,65 +1426,378 @@ def write_links(selection: Selection, catalog: dict, key: str, directory: Path) 
     return destination, len(lines)
 
 
+def aria2_executable() -> Path:
+    path = _bundle_dir() / "third_party" / "aria2" / "aria2c.exe"
+    if not path.is_file():
+        raise RuntimeError("没有找到内置的 aria2")
+    return path
+
+
+def layout_of(array) -> dict:
+    encoding = array.metadata.chunk_key_encoding
+    shards = getattr(array, "shards", None)
+    outer = shards if shards is not None else array.chunks
+    style = str(encoding.name)
+    separator = str(encoding.separator)
+    shape = [int(value) for value in outer]
+    lengths = [int(value) for value in array.shape]
+    if len(shape) != len(lengths) or any(value <= 0 for value in shape):
+        raise RuntimeError("分块形状无效")
+    if style not in {"default", "v2"} or separator not in {"/", "."}:
+        raise RuntimeError("这个数据集的分块地址无法下载")
+    return {"style": style, "separator": separator, "shape": shape, "lengths": lengths}
+
+
+def chunk_count(layout: dict) -> int:
+    total = 1
+    for length, chunk in zip(layout["lengths"], layout["shape"], strict=True):
+        total *= (int(length) + int(chunk) - 1) // int(chunk)
+    return total
+
+
+def full_ranges(layout: dict) -> list[list[tuple[int, int]]]:
+    return [[(0, int(length) - 1)] for length in layout["lengths"]]
+
+
+def chunk_relpaths(name: str, layout: dict, ranges: list) -> list[str]:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise RuntimeError("变量名无法下载")
+    if len(ranges) != len(layout["shape"]):
+        raise RuntimeError(f"{name} 的维度数量和分块不一致")
+    axes = [shard_ids(item, size) for item, size in zip(ranges, layout["shape"], strict=True)]
+    found = []
+    for coords in product(*axes):
+        found.append(f"{name}/{encode_chunk_key(layout['style'], layout['separator'], coords)}")
+    return found
+
+
+def close_group(group) -> None:
+    closer = getattr(getattr(group, "store", None), "close", None)
+    if closer is None:
+        return
+    result = closer()
+    if hasattr(result, "close"):
+        result.close()
+
+
+def inspect_arrays(key: str, catalog: dict, selection: Selection) -> dict[str, dict]:
+    import zarr
+
+    group = zarr.open_group(catalog["url"], mode="r", storage_options=storage_options(key))
+    try:
+        names = [catalog["time_name"], catalog["lat_name"], catalog["lon_name"]]
+        if catalog["level_name"]:
+            names.append(catalog["level_name"])
+        for dim in catalog["var_dims"]:
+            if dim in names or dim in selection.variables:
+                continue
+            if int(catalog["var_sizes"].get(dim, 0)) != 1:
+                continue
+            try:
+                group[dim]
+            except KeyError:
+                continue
+            names.append(str(dim))
+        names.extend(selection.variables)
+        layouts = {}
+        for name in names:
+            layouts[name] = layout_of(group[name])
+        reference = layouts[selection.variables[0]]
+        for name in selection.variables[1:]:
+            if layouts[name] != reference:
+                raise RuntimeError(f"{name} 的分块和其他变量不同")
+        return layouts
+    finally:
+        close_group(group)
+
+
+def metadata_opener(key: str) -> urllib.request.OpenerDirector:
+    manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    manager.add_password(None, f"https://{EDH_DATA_HOST}", "edh", key)
+    return urllib.request.build_opener(
+        urllib.request.HTTPBasicAuthHandler(manager),
+        urllib.request.ProxyHandler({}),
+    )
+
+
+def copy_metadata(cache: Path, catalog: dict, names: list[str], key: str) -> None:
+    opener = metadata_opener(key)
+    root = catalog["url"].rstrip("/")
+    rels = ["zarr.json", ".zgroup", ".zattrs", ".zmetadata"]
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise RuntimeError("变量名无法下载")
+        for suffix in ("zarr.json", ".zarray", ".zattrs"):
+            rels.append(f"{name}/{suffix}")
+    written: set[str] = set()
+    for rel in rels:
+        request = urllib.request.Request(
+            f"{root}/{rel}",
+            headers={"User-Agent": "edh-era5-picker", "Accept": "*/*"},
+        )
+        try:
+            with opener.open(request, timeout=60) as response:
+                body = response.read()
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                continue
+            raise
+        target = cache.joinpath(*rel.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+        if "/" in rel and rel.endswith(("zarr.json", ".zarray")):
+            written.add(rel.split("/")[0])
+    if not (cache / "zarr.json").is_file() and not (cache / ".zgroup").is_file():
+        raise RuntimeError("数据集元数据没有读到")
+    missing = [name for name in names if name not in written]
+    if missing:
+        raise RuntimeError(f"{missing[0]} 的元数据没有读到")
+
+
+def transfer_paths(catalog: dict, selection: Selection, layouts: dict[str, dict]) -> list[str]:
+    rels: list[str] = []
+    dims = [str(dim) for dim in catalog["var_dims"]]
+    data_ranges = [dimension_ranges(dim, selection, catalog) for dim in dims]
+    for name in selection.variables:
+        rels.extend(chunk_relpaths(name, layouts[name], data_ranges))
+    for name, layout in layouts.items():
+        if name in selection.variables:
+            continue
+        count = chunk_count(layout)
+        if count > 8000:
+            raise RuntimeError(f"{name} 的坐标分块过多")
+        rels.extend(chunk_relpaths(name, layout, full_ranges(layout)))
+    unique = list(dict.fromkeys(rels))
+    if len(unique) > MAX_CHUNKS + 8000:
+        raise RuntimeError("对象超过 20000 个，请缩小范围。")
+    return unique
+
+
+def shred_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_file():
+        try:
+            path.write_bytes(b"\0" * path.stat().st_size)
+        except OSError:
+            pass
+        path.unlink(missing_ok=True)
+        return
+    for child in path.rglob("*"):
+        if not child.is_file():
+            continue
+        try:
+            child.write_bytes(b"\0" * child.stat().st_size)
+        except OSError:
+            pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def count_complete(cache: Path, relatives: list[str]) -> int:
+    ready = 0
+    for rel in relatives:
+        path = cache.joinpath(*rel.split("/"))
+        control = path.with_name(path.name + ".aria2")
+        if path.is_file() and not control.exists():
+            ready += 1
+    return ready
+
+
+def stop_job_process(job: Job) -> None:
+    process = job.process
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _capture_output(pipe, sink: bytearray) -> None:
+    try:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                break
+            sink.extend(chunk)
+            if len(sink) > 4096:
+                del sink[:-4096]
+    except Exception:
+        pass
+
+
+def aria2_failure(code: int, tail: bytes) -> str:
+    detail = tail.decode("utf-8", errors="replace")
+    detail = re.sub(r"http-passwd=\S+", "http-passwd=***", detail)
+    detail = " ".join(scrub(detail).split())
+    if len(detail) > 180:
+        detail = detail[-180:]
+    if detail:
+        return f"aria2 退出码 {code}：{detail}"
+    return f"aria2 退出码 {code}"
+
+
+def run_aria2(job: Job, cache: Path, catalog: dict, relatives: list[str], key: str) -> None:
+    if any(char in key for char in "\r\n\x00"):
+        raise RuntimeError("key 无效")
+    secret_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or cache.parent) / f"era5-aria2-{job.id}"
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    conf = secret_dir / "aria2.conf"
+    listing = secret_dir / "files.txt"
+    process: subprocess.Popen | None = None
+    try:
+        conf.write_text(
+            "\n".join(
+                [
+                    "http-user=edh",
+                    f"http-passwd={key}",
+                    "check-certificate=true",
+                    "max-concurrent-downloads=8",
+                    "split=1",
+                    "max-connection-per-server=8",
+                    "file-allocation=none",
+                    "continue=true",
+                    "auto-file-renaming=false",
+                    "allow-overwrite=true",
+                    "max-tries=5",
+                    "retry-wait=2",
+                    "timeout=60",
+                    "connect-timeout=30",
+                    "summary-interval=1",
+                    "show-console-readout=false",
+                    "console-log-level=warn",
+                    "download-result=hide",
+                    "user-agent=edh-era5-picker",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        root = catalog["url"].rstrip("/")
+        lines: list[str] = []
+        for rel in relatives:
+            lines.append(f"{root}/{rel}")
+            lines.append(f"  out={rel}")
+        listing.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for rel in relatives:
+            cache.joinpath(*rel.split("/")).parent.mkdir(parents=True, exist_ok=True)
+        total = len(relatives)
+        job.update(total=total, done=0, message=f"正在下载 0/{total}")
+        process = subprocess.Popen(
+            [
+                str(aria2_executable()),
+                f"--conf-path={conf}",
+                f"--input-file={listing}",
+                f"--dir={cache}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        job.process = process
+        assert process.stdout is not None
+        tail = bytearray()
+        reader = threading.Thread(target=_capture_output, args=(process.stdout, tail), daemon=True)
+        reader.start()
+        while process.poll() is None:
+            if job.cancel.is_set():
+                stop_job_process(job)
+                reader.join(timeout=5)
+                raise RuntimeError("已取消")
+            done = count_complete(cache, relatives)
+            job.update(done=done, message=f"正在下载 {done}/{total}")
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                continue
+        reader.join(timeout=5)
+        code = process.returncode
+        job.process = None
+        if job.cancel.is_set():
+            raise RuntimeError("已取消")
+        if code != 0:
+            raise RuntimeError(aria2_failure(code, bytes(tail)))
+        done = count_complete(cache, relatives)
+        if done != total:
+            raise RuntimeError(f"有 {total - done} 个对象没有下完")
+        job.update(done=total, total=total, message=f"正在下载 {total}/{total}")
+    finally:
+        if process is not None and process.poll() is None:
+            stop_job_process(job)
+        job.process = None
+        shred_tree(secret_dir)
+
+
+def stage_selection(job: Job, key: str, selection: Selection, catalog: dict) -> None:
+    aria2_executable()
+    cache = job.destination.parent / f".{job.destination.stem}.{job.id}.parts"
+    if cache.exists():
+        shutil.rmtree(cache)
+    cache.mkdir(parents=True)
+    job.cache = cache
+    job.update(message="正在读取分块")
+    layouts = inspect_arrays(key, catalog, selection)
+    copy_metadata(cache, catalog, list(layouts), key)
+    relatives = transfer_paths(catalog, selection, layouts)
+    run_aria2(job, cache, catalog, relatives, key)
+
+
 def time_blocks(selection: Selection, catalog: dict):
     chunk = catalog["chunks"]["time"]
-    first = selection.time_i0 // chunk
-    last = selection.time_i1 // chunk
     origin = pd.Timestamp(catalog["time_start"])
-    for block in range(first, last + 1):
-        start = max(selection.time_i0, block * chunk)
-        end = min(selection.time_i1, (block + 1) * chunk - 1)
-        yield start, end, index_to_stamp(origin, catalog["native"], start), index_to_stamp(
-            origin, catalog["native"], end
-        )
+    native = catalog["native"]
+    for start_index, end_index in selection.time_ranges:
+        first = start_index // chunk
+        last = end_index // chunk
+        for block in range(first, last + 1):
+            start = max(start_index, block * chunk)
+            end = min(end_index, (block + 1) * chunk - 1)
+            yield (
+                start,
+                end,
+                index_to_stamp(origin, native, start),
+                index_to_stamp(origin, native, end),
+            )
+
+
+def selected_index(store: xr.Dataset, selection: Selection, catalog: dict) -> pd.DatetimeIndex:
+    time_name = catalog["time_name"]
+    parts = []
+    for i0, i1 in selection.time_ranges:
+        values = store[time_name].isel({time_name: slice(i0, i1 + 1)}).values
+        parts.append(np.asarray(pd.to_datetime(np.asarray(values)), dtype="datetime64[ns]"))
+    index = pd.DatetimeIndex(np.concatenate(parts))
+    if index.tz is not None:
+        index = index.tz_convert("UTC").tz_localize(None)
+    return index
 
 
 def assert_complete(index: pd.DatetimeIndex, selection: Selection, catalog: dict) -> None:
     native = catalog["native"]
-    if native == "hourly":
-        expected = pd.date_range(
-            f"{selection.start.isoformat()}T00:00:00",
-            f"{selection.end.isoformat()}T23:00:00",
-            freq="h",
-        )
-        observed = pd.Series(1, index=index).resample("1D").sum()
-        observed = observed.reindex(pd.date_range(selection.start, selection.end, freq="D"), fill_value=0)
-        bad = observed[observed != 24]
-        if len(bad):
-            sample = ", ".join(stamp.strftime("%Y-%m-%d") for stamp in list(bad.index[:3]))
-            raise RuntimeError(
-                f"有 {len(bad)} 天不是 24 个时次（例如 {sample}）。需要当天 00–23 UTC 都在。"
-            )
-        if len(index) != len(expected) or not index.equals(expected):
-            raise RuntimeError("时次不连续")
+    stamps = pd.DatetimeIndex(index)
+    if native == "monthly":
+        expected = {(item.year, item.month) for item in selection.dates}
+        observed = {(int(stamp.year), int(stamp.month)) for stamp in stamps}
+        if observed != expected or len(stamps) != len(expected):
+            raise RuntimeError("有月份不在数据集里")
         return
-    if native == "3hourly":
-        expected = pd.date_range(
-            f"{selection.start.isoformat()}T00:00:00",
-            f"{selection.end.isoformat()}T21:00:00",
-            freq="3h",
-        )
-        observed = pd.Series(1, index=index).resample("1D").sum()
-        observed = observed.reindex(pd.date_range(selection.start, selection.end, freq="D"), fill_value=0)
-        bad = observed[observed != 8]
-        if len(bad):
-            sample = ", ".join(stamp.strftime("%Y-%m-%d") for stamp in list(bad.index[:3]))
-            raise RuntimeError(
-                f"有 {len(bad)} 天不是 8 个时次（例如 {sample}）。需要当天 00–21 UTC 的 3 小时分析都在。"
-            )
-        if len(index) != len(expected) or not index.equals(expected):
-            raise RuntimeError("时次不连续")
-        return
-    if native == "daily":
-        expected = pd.date_range(selection.start, selection.end, freq="D")
-        observed = pd.DatetimeIndex(index).normalize()
-        if len(observed) != len(expected) or not observed.equals(expected):
-            raise RuntimeError("有日期不在数据集里，或这些日期不是逐日连续")
-        return
-    expected = pd.period_range(selection.start.isoformat(), selection.end.isoformat(), freq="M")
-    observed = pd.DatetimeIndex(index).to_period("M")
-    if len(observed) != len(expected) or not observed.equals(pd.PeriodIndex(expected)):
-        raise RuntimeError("有月份不在数据集里，或这些月份不是逐月连续")
+    per_day = {"hourly": 24, "3hourly": 8, "daily": 1}[native]
+    counts = stamps.normalize().value_counts()
+    bad = []
+    for current in selection.dates:
+        if int(counts.get(pd.Timestamp(current), 0)) != per_day:
+            bad.append(current.isoformat())
+    if bad:
+        sample = ", ".join(bad[:3])
+        raise RuntimeError(f"有 {len(bad)} 天的时次不完整（例如 {sample}）")
+    if len(counts) != selection.days:
+        raise RuntimeError("出现了未选择的日期")
 
 
 def load_piece(piece: xr.Dataset) -> xr.Dataset:
@@ -1504,44 +1979,28 @@ def perform(job: Job, session: Session, selection: Selection, catalog: dict, pla
     destination = job.destination
     temporary = job.temporary
     temporary.unlink(missing_ok=True)
-    blocks = list(time_blocks(selection, catalog))
-    job.update(total=len(blocks), done=0, message="正在打开数据集")
-    split = plan["decoded_one_variable"] * len(selection.variables) > MAX_BLOCK_BYTES
-    store = open_store(session.key, catalog["url"])
-    pieces: list[xr.Dataset] = []
+    store = None
     replaced = False
     time_name = catalog["time_name"]
     try:
         if job.cancel.is_set():
             raise RuntimeError("已取消")
-        index = pd.DatetimeIndex(
-            pd.to_datetime(
-                store[time_name].isel({time_name: slice(selection.time_i0, selection.time_i1 + 1)}).values
-            )
-        )
-        if index.tz is not None:
-            index = index.tz_convert("UTC").tz_localize(None)
-        assert_complete(index, selection, catalog)
+        stage_selection(job, session.key, selection, catalog)
+        blocks = list(time_blocks(selection, catalog))
+        job.update(message="正在打开本地数据")
+        store = xr.open_zarr(str(job.cache), consolidated=False, chunks={})
+        if job.cancel.is_set():
+            raise RuntimeError("已取消")
+        assert_complete(selected_index(store, selection, catalog), selection, catalog)
+        split = plan["decoded_one_variable"] * len(selection.variables) > MAX_BLOCK_BYTES
+        pieces: list[xr.Dataset] = []
         for number, (i0, i1, t0, t1) in enumerate(blocks, start=1):
             if job.cancel.is_set():
                 raise RuntimeError("已取消")
             label = f"{t0.strftime('%Y-%m-%d')}–{t1.strftime('%Y-%m-%d')}"
             job.update(message=f"正在读取 {label}（{number}/{len(blocks)}）")
-            loaded = None
-            for attempt in (1, 2):
-                try:
-                    loaded = read_slice(store, selection, catalog, i0, i1, split)
-                    break
-                except Exception as error:
-                    if attempt == 2 or job.cancel.is_set():
-                        raise
-                    log(f"RETRY\t{label}\tattempt={attempt}\t{public_error(error)}")
-                    store.close()
-                    store = open_store(session.key, catalog["url"])
-            pieces.append(loaded)
-            del loaded
+            pieces.append(read_slice(store, selection, catalog, i0, i1, split))
             gc.collect()
-            job.update(done=number)
         if job.cancel.is_set():
             raise RuntimeError("已取消")
         combined = pieces[0] if len(pieces) == 1 else xr.concat(pieces, dim=time_name)
@@ -1570,14 +2029,19 @@ def perform(job: Job, session: Session, selection: Selection, catalog: dict, pla
             path=str(destination),
             nbytes=destination.stat().st_size,
         )
-        log(f"WROTE\t{destination}\tbytes={destination.stat().st_size}")
+        log(f"WROTE\t{destination.name}\tbytes={destination.stat().st_size}")
     except Exception:
         temporary.unlink(missing_ok=True)
         if replaced:
             destination.unlink(missing_ok=True)
         raise
     finally:
-        store.close()
+        if store is not None:
+            store.close()
+        stop_job_process(job)
+        if job.cache is not None:
+            shutil.rmtree(job.cache, ignore_errors=True)
+            job.cache = None
         gc.collect()
 
 
@@ -1616,6 +2080,12 @@ def catalog_payload(catalog: dict) -> dict:
         "time_end": catalog["time_end"],
         "first_day": catalog["first_day"],
         "last_day": catalog["last_day"],
+        "years": list(
+            range(
+                date.fromisoformat(catalog["first_day"]).year,
+                date.fromisoformat(catalog["last_day"]).year + 1,
+            )
+        ),
         "levels": [json_number(level) for level in catalog["levels"]],
         "variables": catalog["variables"],
         "resolutions": catalog["resolutions"],
@@ -1810,11 +2280,25 @@ class Handler(BaseHTTPRequestHandler):
         plan = estimate(selection, catalog)
         if not plan["allowed"]:
             raise ValueError(plan["message"])
+        with STATE_LOCK:
+            running = CURRENT["job"]
+        if running is not None and running.state == "running":
+            raise ValueError("已有下载在进行")
         directory = resolve_output_dir(payload.get("output_dir"))
         directory.mkdir(parents=True, exist_ok=True)
-        destination, count = write_links(selection, catalog, session.key, directory)
-        log(f"LINKS\t{destination.name}\tcount={count}")
-        self._send(200, {"path": str(destination), "count": count})
+        destination = directory / output_name(selection, catalog)
+        if destination.exists():
+            raise ValueError(f"目标文件已存在：{destination.name}。请换目录或先移走该文件。")
+        job = Job(selection, destination)
+        with STATE_LOCK:
+            CURRENT["job"] = job
+        threading.Thread(
+            target=run_job,
+            args=(job, session, selection, catalog, plan),
+            daemon=True,
+        ).start()
+        log(f"START\t{destination.name}\tchunks={plan['chunks']}")
+        self._send(200, {"job": job.id})
 
     def _cancel(self, payload: dict) -> None:
         job_id = payload.get("job")
@@ -1823,6 +2307,7 @@ class Handler(BaseHTTPRequestHandler):
         if job is None or job.id != job_id:
             raise ValueError("没有正在进行的下载")
         job.cancel.set()
+        stop_job_process(job)
         job.update(message="正在取消")
         log("CANCEL\trequested")
         self._send(200, {"ok": True})

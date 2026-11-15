@@ -1,0 +1,6 @@
+aria2 1.37.0 win-64bit-build1
+
+https://github.com/aria2/aria2/releases/tag/release-1.37.0
+https://github.com/aria2/aria2/archive/refs/tags/release-1.37.0.tar.gz
+
+本程序把 aria2c.exe 作为单独进程调用，不把它链接进 Python。
