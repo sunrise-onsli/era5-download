@@ -10,6 +10,7 @@ the selected objects with aria2 and writes one NetCDF.
 from __future__ import annotations
 
 import argparse
+import base64
 import gc
 import json
 import logging
@@ -1511,17 +1512,27 @@ def inspect_arrays(key: str, catalog: dict, selection: Selection) -> dict[str, d
         close_group(group)
 
 
-def metadata_opener(key: str) -> urllib.request.OpenerDirector:
-    manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-    manager.add_password(None, f"https://{EDH_DATA_HOST}", "edh", key)
-    return urllib.request.build_opener(
-        urllib.request.HTTPBasicAuthHandler(manager),
-        urllib.request.ProxyHandler({}),
+def metadata_opener() -> urllib.request.OpenerDirector:
+    # ProxyHandler({}) keeps urllib from using netrc or an environment proxy.
+    # The Authorization header is set on the request: this host answers 401
+    # without WWW-Authenticate, so HTTPBasicAuthHandler never retries.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def metadata_request(url: str, key: str) -> urllib.request.Request:
+    token = base64.b64encode(b"edh:" + key.encode("utf-8")).decode("ascii")
+    return urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "edh-era5-picker",
+            "Accept": "*/*",
+            "Authorization": "Basic " + token,
+        },
     )
 
 
 def copy_metadata(cache: Path, catalog: dict, names: list[str], key: str) -> None:
-    opener = metadata_opener(key)
+    opener = metadata_opener()
     root = catalog["url"].rstrip("/")
     rels = ["zarr.json", ".zgroup", ".zattrs", ".zmetadata"]
     for name in names:
@@ -1531,10 +1542,7 @@ def copy_metadata(cache: Path, catalog: dict, names: list[str], key: str) -> Non
             rels.append(f"{name}/{suffix}")
     written: set[str] = set()
     for rel in rels:
-        request = urllib.request.Request(
-            f"{root}/{rel}",
-            headers={"User-Agent": "edh-era5-picker", "Accept": "*/*"},
-        )
+        request = metadata_request(f"{root}/{rel}", key)
         try:
             with opener.open(request, timeout=60) as response:
                 body = response.read()
